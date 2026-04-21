@@ -178,6 +178,61 @@ impl StorageClient {
         }
     }
 
+    // ── Conditional manifest CAS (Stage A primitive) ──
+    //
+    // Opt-in CAS surface for backends that support it. S3 uses the ETag
+    // captured on GET to gate PUTs with `If-Match`. Local and HTTP backends
+    // silently ignore the token (single-writer or no-CAS-support semantics).
+    // Callers threading a CAS loop should be prepared for backends that
+    // return `None` from [`get_manifest_with_cas_token`] — on those, the
+    // loop degenerates to an unconditional write.
+
+    /// Fetch the manifest together with a backend-specific CAS token that
+    /// can later be passed to [`put_manifest_conditional`]. For S3 the token
+    /// is the object's ETag; for other backends the token is `None` and
+    /// conditional writes have no effect.
+    #[cfg(feature = "cloud")]
+    #[allow(dead_code)]
+    pub(crate) fn get_manifest_with_cas_token(
+        &self,
+    ) -> io::Result<(Option<Manifest>, Option<String>)> {
+        match self {
+            StorageClient::Local { .. } => {
+                let (m, _) = self.get_manifest_with_dirty_groups()?;
+                Ok((m, None))
+            }
+            StorageClient::S3(s3) => s3.get_manifest_with_etag(),
+            StorageClient::Http(http) => Ok((http.get_manifest()?, None)),
+        }
+    }
+
+    /// Store the manifest with an optional CAS token. When the backend
+    /// supports CAS (S3) and `if_match` is `Some`, a mismatch surfaces as
+    /// [`ManifestCasError::PreconditionFailed`]. Backends without CAS
+    /// support ignore the token and succeed as an unconditional write.
+    #[cfg(feature = "cloud")]
+    #[allow(dead_code)]
+    pub(crate) fn put_manifest_conditional(
+        &self,
+        manifest: &Manifest,
+        dirty_groups: &[u64],
+        if_match: Option<&str>,
+    ) -> Result<(), ManifestCasError> {
+        match self {
+            StorageClient::Local { base_dir } => {
+                let local = manifest::LocalManifest {
+                    manifest: manifest.clone(),
+                    dirty_groups: dirty_groups.to_vec(),
+                };
+                local.persist(base_dir).map_err(ManifestCasError::Io)
+            }
+            StorageClient::S3(s3) => s3.put_manifest_conditional(manifest, if_match),
+            StorageClient::Http(http) => {
+                http.put_manifest(manifest).map_err(ManifestCasError::Io)
+            }
+        }
+    }
+
     /// Check if a database exists at this storage location.
     pub(crate) fn exists(&self) -> io::Result<bool> {
         match self {

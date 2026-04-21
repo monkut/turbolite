@@ -443,6 +443,173 @@ impl S3Client {
         self.put_object_async(&key, data, Some("application/msgpack")).await
     }
 
+    // ── Conditional manifest CAS (Iceberg-style commit protocol) ──
+    //
+    // S3 supports If-Match on PutObject since Nov 2024. Paired with an ETag
+    // captured at GET time, this gives us optimistic concurrency on the
+    // manifest pointer — the same shape Apache Iceberg uses for its table
+    // metadata commit. `put_manifest_conditional_async` returns
+    // `ManifestCasError::PreconditionFailed` (not a plain io::Error) when a
+    // concurrent writer has committed first, so callers can distinguish CAS
+    // conflicts from transient I/O faults and implement retry/rebase loops.
+    //
+    // Stage A (this commit): primitives only. No call-site migration.
+
+    /// Fetch the manifest along with the S3 ETag for conditional PUT.
+    /// Returns `(None, None)` when no manifest exists yet.
+    pub(crate) async fn get_manifest_with_etag_async(
+        &self,
+    ) -> io::Result<(Option<Manifest>, Option<String>)> {
+        // Try msgpack first
+        let msgpack_key = self.manifest_key_msgpack();
+        if let Some((bytes, etag)) = self.get_object_with_etag_async(&msgpack_key).await? {
+            let mut manifest: Manifest = rmp_serde::from_slice(&bytes).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid manifest msgpack: {}", e),
+                )
+            })?;
+            manifest.build_page_index();
+            return Ok((Some(manifest), Some(etag)));
+        }
+        // Fall back to JSON (pre-Thermopylae manifests)
+        let json_key = self.manifest_key_json();
+        match self.get_object_with_etag_async(&json_key).await? {
+            Some((bytes, etag)) => {
+                let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid manifest JSON: {}", e),
+                    )
+                })?;
+                manifest.build_page_index();
+                Ok((Some(manifest), Some(etag)))
+            }
+            None => Ok((None, None)),
+        }
+    }
+
+    /// Blocking wrapper for [`get_manifest_with_etag_async`].
+    pub(crate) fn get_manifest_with_etag(
+        &self,
+    ) -> io::Result<(Option<Manifest>, Option<String>)> {
+        S3Client::block_on(&self.runtime, self.get_manifest_with_etag_async())
+    }
+
+    /// PUT the manifest with an optional `If-Match` precondition.
+    ///
+    /// When `if_match` is `Some(etag)`, the write succeeds only if the current
+    /// object's ETag equals `etag`. A mismatch surfaces as
+    /// [`ManifestCasError::PreconditionFailed`] — the caller decides whether
+    /// to refetch + rebase + retry.
+    ///
+    /// When `if_match` is `None`, behaves as an unconditional write (equivalent
+    /// to [`put_manifest_async`]). This variant exists so callers migrating
+    /// to the CAS API can flip the behavior via one flag rather than maintain
+    /// two code paths.
+    ///
+    /// No internal retry loop: precondition failures are a CAS signal, and
+    /// transient I/O failures are the caller's responsibility since a retry
+    /// would race against other writers.
+    pub(crate) async fn put_manifest_conditional_async(
+        &self,
+        manifest: &Manifest,
+        if_match: Option<&str>,
+    ) -> Result<(), ManifestCasError> {
+        let key = self.manifest_key_msgpack();
+        let data = rmp_serde::to_vec(manifest)
+            .map_err(|e| ManifestCasError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
+        let data_len = data.len() as u64;
+        let body = aws_sdk_s3::primitives::ByteStream::from(data);
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .body(body)
+            .content_type("application/msgpack");
+        if let Some(etag) = if_match {
+            req = req.if_match(etag);
+        }
+        match req.send().await {
+            Ok(_) => {
+                self.put_count.fetch_add(1, Ordering::Relaxed);
+                self.put_bytes.fetch_add(data_len, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                if is_precondition_failed(&e) {
+                    Err(ManifestCasError::PreconditionFailed)
+                } else {
+                    Err(ManifestCasError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("S3 PUT {} failed: {}", key, e),
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Blocking wrapper for [`put_manifest_conditional_async`].
+    pub(crate) fn put_manifest_conditional(
+        &self,
+        manifest: &Manifest,
+        if_match: Option<&str>,
+    ) -> Result<(), ManifestCasError> {
+        S3Client::block_on(
+            &self.runtime,
+            self.put_manifest_conditional_async(manifest, if_match),
+        )
+    }
+
+    /// GET that captures the S3 ETag. Mirrors [`get_object_async`]'s retry
+    /// semantics (3 retries on transient errors, None on 404).
+    async fn get_object_with_etag_async(
+        &self,
+        key: &str,
+    ) -> io::Result<Option<(Vec<u8>, String)>> {
+        let mut retries = 0u32;
+        loop {
+            match self
+                .client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let etag = resp.e_tag().map(|s| s.to_string()).unwrap_or_default();
+                    let bytes = resp
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                        .into_bytes();
+                    self.fetch_count.fetch_add(1, Ordering::Relaxed);
+                    self.fetch_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    return Ok(Some((bytes.to_vec(), etag)));
+                }
+                Err(e) => {
+                    if is_not_found(&e) {
+                        return Ok(None);
+                    }
+                    retries += 1;
+                    if retries >= 3 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("S3 GET {} failed after 3 retries: {:?}", key, e),
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (1 << retries),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
     /// Delete a batch of S3 objects by key. Handles batching (AWS limit: 1000/request).
     pub(crate) fn delete_objects(&self, keys: &[String]) -> io::Result<()> {
         if keys.is_empty() {
@@ -629,6 +796,61 @@ pub(crate) fn is_not_found<E: std::fmt::Display + std::fmt::Debug>(
             service_err.raw().status().as_u16() == 404
         }
         _ => false,
+    }
+}
+
+#[cfg(feature = "cloud")]
+/// Check if an S3 error is a 412 / PreconditionFailed (If-Match mismatch).
+pub(crate) fn is_precondition_failed<E: std::fmt::Display + std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+) -> bool {
+    match err {
+        aws_sdk_s3::error::SdkError::ServiceError(service_err) => {
+            service_err.raw().status().as_u16() == 412
+        }
+        _ => false,
+    }
+}
+
+/// Error from a conditional manifest PUT. Distinct from [`io::Error`] so
+/// callers can branch on CAS conflicts vs. general I/O faults.
+#[cfg(feature = "cloud")]
+#[derive(Debug)]
+pub(crate) enum ManifestCasError {
+    /// S3 returned 412 Precondition Failed — another writer committed a
+    /// newer manifest after we read the one we tried to CAS against. Caller
+    /// should refetch the manifest, rebase its in-progress changes, and retry.
+    PreconditionFailed,
+    /// Any other error (network, serialization, non-412 service errors).
+    Io(io::Error),
+}
+
+#[cfg(feature = "cloud")]
+impl std::fmt::Display for ManifestCasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManifestCasError::PreconditionFailed => {
+                write!(f, "manifest CAS precondition failed (concurrent writer)")
+            }
+            ManifestCasError::Io(e) => write!(f, "manifest CAS I/O error: {}", e),
+        }
+    }
+}
+
+#[cfg(feature = "cloud")]
+impl std::error::Error for ManifestCasError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ManifestCasError::PreconditionFailed => None,
+            ManifestCasError::Io(e) => Some(e),
+        }
+    }
+}
+
+#[cfg(feature = "cloud")]
+impl From<io::Error> for ManifestCasError {
+    fn from(e: io::Error) -> Self {
+        ManifestCasError::Io(e)
     }
 }
 
