@@ -93,6 +93,13 @@ rmp-serde = "1.3.1"
 proptest = "1.5"
 proptest-derive = "0.5"
 arbitrary = { version = "1.3", features = ["derive"] }
+# test-util feature enables StaticReplayClient for SDK-layer mock tests
+# (e.g. ManifestCasError wiring against a 412 PutObject response).
+# `macros` enables #[tokio::test]; additive to the main tokio features.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+aws-smithy-runtime = { version = "1", features = ["client", "test-util"] }
+aws-smithy-types = "1"
+http = "1"
 
 [[bin]]
 name = "turbolite"
