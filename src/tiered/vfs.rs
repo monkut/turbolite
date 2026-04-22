@@ -37,6 +37,19 @@ pub struct TurboliteVfs {
     /// Shared manifest state. Written by TurboliteHandle during sync/checkpoint,
     /// read by flush_to_s3() for non-blocking S3 upload.
     shared_manifest: Arc<ArcSwap<Manifest>>,
+    /// Cached S3 ETag of the currently-known manifest. Used as the `If-Match`
+    /// precondition on the next manifest PUT so a concurrent writer can't
+    /// overwrite our base state silently (Iceberg-style commit protocol).
+    ///
+    /// `None` for Local / HTTP backends (no CAS support) and for the first
+    /// PUT before S3 has ever received this prefix's manifest. Updated to
+    /// the new ETag on every successful `commit_manifest`; cleared on 412
+    /// so callers know their cached base state is stale.
+    ///
+    /// `std::sync::Mutex` (not `ArcSwap`) because the read/swap pairs are
+    /// coupled (CAS loops read-then-write), access is serialized by the
+    /// SQLite EXCLUSIVE lock, and contention is minimal.
+    shared_manifest_etag: Arc<std::sync::Mutex<Option<String>>>,
     /// Shared pending S3 groups. Accumulated by TurboliteHandle during local-only
     /// checkpoints, drained by flush_to_s3(). Legacy path for global
     /// LOCAL_CHECKPOINT_ONLY flag; SyncMode::LocalThenFlush uses staging logs.
@@ -154,6 +167,8 @@ impl TurboliteVfs {
             #[cfg(feature = "cloud")]
             _runtime: None,
             shared_manifest,
+            // HTTP backend: no S3 CAS — etag cell stays None.
+            shared_manifest_etag: Arc::new(std::sync::Mutex::new(None)),
             shared_dirty_groups,
             pending_flushes,
             staging_seq,
@@ -276,6 +291,8 @@ impl TurboliteVfs {
             #[cfg(feature = "cloud")]
             _runtime: None,
             shared_manifest,
+            // Local backend: no S3 CAS — etag cell stays None.
+            shared_manifest_etag: Arc::new(std::sync::Mutex::new(None)),
             shared_dirty_groups,
             pending_flushes,
             staging_seq,
@@ -414,6 +431,11 @@ impl TurboliteVfs {
         let page_count = Arc::new(AtomicU64::new(manifest.page_count));
 
         let shared_manifest = Arc::new(ArcSwap::from_pointee(manifest));
+        // Best-effort: capture the current S3 ETag so the next PUT can CAS
+        // against it. Failure to fetch here is non-fatal — an unconditional
+        // first PUT still gives correct single-writer behavior.
+        let initial_etag: Option<String> = s3.get_manifest_with_etag().ok().and_then(|(_, e)| e);
+        let shared_manifest_etag = Arc::new(std::sync::Mutex::new(initial_etag));
 
         let prefetch_pool = Arc::new(PrefetchPool::new(
             config.prefetch_threads,
@@ -442,6 +464,7 @@ impl TurboliteVfs {
             config,
             _runtime: owned_runtime,
             shared_manifest,
+            shared_manifest_etag,
             shared_dirty_groups,
             pending_flushes,
             staging_seq,
@@ -1422,6 +1445,7 @@ impl Vfs for TurboliteVfs {
                 if self.storage.is_local() { Some(Arc::clone(&self.storage)) } else { None },
                 Arc::clone(&self.cache),
                 Arc::clone(&self.shared_manifest),
+                Arc::clone(&self.shared_manifest_etag),
                 Arc::clone(&self.shared_dirty_groups),
                 Arc::clone(&self.pending_flushes),
                 Arc::clone(&self.staging_seq),

@@ -226,7 +226,13 @@ impl StorageClient {
                 };
                 local.persist(base_dir).map_err(ManifestCasError::Io)
             }
-            StorageClient::S3(s3) => s3.put_manifest_conditional(manifest, if_match),
+            StorageClient::S3(s3) => {
+                // Passthrough discards the returned new-ETag — callers using
+                // the `StorageClient` abstraction don't participate in the
+                // CAS loop (that lives at the `S3Client::commit_manifest`
+                // layer where the ETag cell is owned).
+                s3.put_manifest_conditional(manifest, if_match).map(|_| ())
+            }
             StorageClient::Http(http) => {
                 http.put_manifest(manifest).map_err(ManifestCasError::Io)
             }

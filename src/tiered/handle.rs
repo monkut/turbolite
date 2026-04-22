@@ -22,6 +22,12 @@ pub struct TurboliteHandle {
     /// during a store(), which is safe because page data in the cache file is immutable
     /// once written (pages are never overwritten, only new versions are added).
     manifest: Arc<ArcSwap<Manifest>>,
+    /// Cached S3 ETag of the currently-known manifest. Used as the `If-Match`
+    /// precondition on manifest PUT during sync() (Iceberg-style commit).
+    /// `None` for non-S3 backends; updated on every successful conditional PUT;
+    /// cleared on 412 so the next PUT detects the staleness and refuses to
+    /// silently overwrite a concurrent writer's commit.
+    manifest_etag: Arc<std::sync::Mutex<Option<String>>>,
     /// Dirty page numbers (data lives in disk cache, not in memory).
     /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
     /// holding a second copy of every dirty page in memory.
@@ -127,6 +133,7 @@ impl TurboliteHandle {
         storage: Option<Arc<StorageClient>>,
         cache: Arc<DiskCache>,
         shared_manifest: Arc<ArcSwap<Manifest>>,
+        shared_manifest_etag: Arc<std::sync::Mutex<Option<String>>>,
         shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
         pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
         staging_seq: Arc<AtomicU64>,
@@ -333,6 +340,7 @@ impl TurboliteHandle {
             storage,
             cache: Some(cache),
             manifest: shared_manifest,
+            manifest_etag: shared_manifest_etag,
             dirty_page_nums: RwLock::new(HashSet::new()),
             s3_dirty_groups: shared_dirty_groups,
             page_size: std::sync::atomic::AtomicU32::new(page_size),
@@ -381,6 +389,7 @@ impl TurboliteHandle {
             storage: None,
             cache: None,
             manifest: Arc::new(ArcSwap::from_pointee(Manifest::empty())),
+            manifest_etag: Arc::new(std::sync::Mutex::new(None)),
             dirty_page_nums: RwLock::new(HashSet::new()),
             s3_dirty_groups: Arc::new(Mutex::new(HashSet::new())),
             page_size: std::sync::atomic::AtomicU32::new(0),
@@ -2090,7 +2099,12 @@ impl DatabaseHandle for TurboliteHandle {
                 db_header,
             };
             new_manifest.build_page_index();
-            s3.put_manifest(&new_manifest)?;
+            // CAS commit: fails with InvalidInput if a concurrent writer has
+            // committed a newer manifest since we fetched ours. Caller (the
+            // SQLite sync callback) surfaces the io::Error to SQLite, which
+            // aborts the statement. rustyhip's HTTP handler maps the resulting
+            // error to a 500 the caller can retry from a cold start.
+            s3.commit_manifest(&new_manifest, &self.manifest_etag)?;
 
             // Commit local state
             {
@@ -2751,7 +2765,8 @@ impl DatabaseHandle for TurboliteHandle {
             db_header,
         };
         new_manifest.build_page_index();
-        s3.put_manifest(&new_manifest)?;
+        // CAS commit (see above call site for rationale).
+        s3.commit_manifest(&new_manifest, &self.manifest_etag)?;
 
         // Commit local state
         {

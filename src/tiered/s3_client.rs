@@ -508,6 +508,9 @@ impl S3Client {
     /// to the CAS API can flip the behavior via one flag rather than maintain
     /// two code paths.
     ///
+    /// On success, returns the new object's ETag so the caller can cache it
+    /// for the next conditional PUT without an extra GET round-trip.
+    ///
     /// No internal retry loop: precondition failures are a CAS signal, and
     /// transient I/O failures are the caller's responsibility since a retry
     /// would race against other writers.
@@ -515,7 +518,7 @@ impl S3Client {
         &self,
         manifest: &Manifest,
         if_match: Option<&str>,
-    ) -> Result<(), ManifestCasError> {
+    ) -> Result<Option<String>, ManifestCasError> {
         let key = self.manifest_key_msgpack();
         let data = rmp_serde::to_vec(manifest)
             .map_err(|e| ManifestCasError::Io(io::Error::new(io::ErrorKind::Other, e)))?;
@@ -532,10 +535,10 @@ impl S3Client {
             req = req.if_match(etag);
         }
         match req.send().await {
-            Ok(_) => {
+            Ok(resp) => {
                 self.put_count.fetch_add(1, Ordering::Relaxed);
                 self.put_bytes.fetch_add(data_len, Ordering::Relaxed);
-                Ok(())
+                Ok(resp.e_tag().map(|s| s.to_string()))
             }
             Err(e) => {
                 if is_precondition_failed(&e) {
@@ -555,11 +558,45 @@ impl S3Client {
         &self,
         manifest: &Manifest,
         if_match: Option<&str>,
-    ) -> Result<(), ManifestCasError> {
+    ) -> Result<Option<String>, ManifestCasError> {
         S3Client::block_on(
             &self.runtime,
             self.put_manifest_conditional_async(manifest, if_match),
         )
+    }
+
+    /// Commit a manifest using the cached ETag as the `If-Match` precondition.
+    ///
+    /// On success, updates `etag_cell` to the new ETag returned by S3 so the
+    /// next commit CAS against it. On precondition failure, clears the cell
+    /// (forcing the next write to be unconditional, which is *not* what you
+    /// want mid-request — callers should treat this error as fatal for the
+    /// in-flight transaction and restart from a fresh GET) and returns an
+    /// `io::Error` with `ErrorKind::InvalidInput`.
+    ///
+    /// This is the right primitive for the primary checkpoint path. For call
+    /// sites that truly need unconditional writes (initial seed, import,
+    /// benchmarking), use [`put_manifest`] directly.
+    pub(crate) fn commit_manifest(
+        &self,
+        manifest: &Manifest,
+        etag_cell: &std::sync::Mutex<Option<String>>,
+    ) -> io::Result<()> {
+        let if_match = etag_cell.lock().expect("manifest etag mutex poisoned").clone();
+        match self.put_manifest_conditional(manifest, if_match.as_deref()) {
+            Ok(new_etag) => {
+                *etag_cell.lock().expect("manifest etag mutex poisoned") = new_etag;
+                Ok(())
+            }
+            Err(ManifestCasError::PreconditionFailed) => {
+                *etag_cell.lock().expect("manifest etag mutex poisoned") = None;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "manifest CAS precondition failed: a concurrent writer committed first",
+                ))
+            }
+            Err(ManifestCasError::Io(e)) => Err(e),
+        }
     }
 
     /// GET that captures the S3 ETag. Mirrors [`get_object_async`]'s retry
