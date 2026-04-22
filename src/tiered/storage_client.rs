@@ -239,6 +239,27 @@ impl StorageClient {
         }
     }
 
+    /// Commit the manifest through the backend using the given ETag cell
+    /// as the CAS token (S3 only). For local / HTTP backends this is a
+    /// plain unconditional write — they have no cross-process coordination.
+    ///
+    /// Parallel of [`s3_client::S3Client::commit_manifest`], at the backend
+    /// abstraction layer. Used by call sites (compact, rotation) that write
+    /// manifests through `StorageClient` rather than a direct `&S3Client`.
+    #[cfg(feature = "cloud")]
+    pub(crate) fn commit_manifest(
+        &self,
+        manifest: &Manifest,
+        dirty_groups: &[u64],
+        etag_cell: &std::sync::Mutex<Option<String>>,
+    ) -> io::Result<()> {
+        match self {
+            StorageClient::Local { .. } => self.put_manifest(manifest, dirty_groups),
+            StorageClient::S3(s3) => s3.commit_manifest(manifest, etag_cell),
+            StorageClient::Http(http) => http.put_manifest(manifest),
+        }
+    }
+
     /// Check if a database exists at this storage location.
     pub(crate) fn exists(&self) -> io::Result<bool> {
         match self {

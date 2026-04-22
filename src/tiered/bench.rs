@@ -14,6 +14,7 @@ pub struct TurboliteSharedState {
     pub(super) prefetch_pool: Arc<PrefetchPool>,
     // Shared state for flush_to_s3()
     pub(super) shared_manifest: Arc<ArcSwap<Manifest>>,
+    pub(super) shared_manifest_etag: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) shared_dirty_groups: Arc<Mutex<HashSet<u64>>>,
     pub(super) pending_flushes: Arc<Mutex<Vec<staging::PendingFlush>>>,
     pub(super) flush_lock: Arc<Mutex<()>>,
@@ -239,6 +240,7 @@ impl TurboliteSharedState {
             &self.s3,
             &self.cache,
             &self.shared_manifest,
+            &self.shared_manifest_etag,
             &self.shared_dirty_groups,
             &self.pending_flushes,
             self.compression_level,

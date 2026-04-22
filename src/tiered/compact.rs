@@ -217,12 +217,13 @@ pub struct OverrideCompactResult {
 pub(crate) fn auto_compact_overrides(
     storage: &StorageClient,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     compaction_threshold: u32,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
-    compact_overrides_inner(storage, shared_manifest, Some(compaction_threshold), compression_level,
+    compact_overrides_inner(storage, shared_manifest, shared_manifest_etag, Some(compaction_threshold), compression_level,
         #[cfg(feature = "zstd")] dictionary, encryption_key)
 }
 
@@ -231,17 +232,19 @@ pub(crate) fn auto_compact_overrides(
 pub(crate) fn compact_all_overrides(
     storage: &StorageClient,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
 ) -> io::Result<usize> {
-    compact_overrides_inner(storage, shared_manifest, None, compression_level,
+    compact_overrides_inner(storage, shared_manifest, shared_manifest_etag, None, compression_level,
         #[cfg(feature = "zstd")] dictionary, encryption_key)
 }
 
 fn compact_overrides_inner(
     storage: &StorageClient,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     threshold: Option<u32>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
@@ -306,7 +309,8 @@ fn compact_overrides_inner(
     }
 
     let manifest_for_persist = (**shared_manifest.load()).clone();
-    storage.put_manifest(&manifest_for_persist, &[])?;
+    // CAS commit (local backend falls through to unconditional write).
+    storage.commit_manifest(&manifest_for_persist, &[], shared_manifest_etag)?;
 
     if !all_replaced_keys.is_empty() {
         let _ = storage.delete_page_groups(&all_replaced_keys);

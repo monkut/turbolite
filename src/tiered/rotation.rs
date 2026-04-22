@@ -75,10 +75,15 @@ pub fn rotate_encryption_key(
     };
     let s3 = S3Client::block_on(&handle, S3Client::new_async(&s3_cfg))?;
 
-    // Fetch manifest
-    let manifest = s3.get_manifest()?.ok_or_else(|| {
+    // Fetch manifest together with its S3 ETag. Rotation is documented as an
+    // offline operation ("close all connections before rotating"), but CAS
+    // still protects against an overlooked writer — the final commit fails
+    // loudly rather than silently clobbering an active manifest.
+    let (manifest_opt, initial_etag) = s3.get_manifest_with_etag()?;
+    let manifest = manifest_opt.ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "No manifest found in S3")
     })?;
+    let etag_cell = std::sync::Mutex::new(initial_etag);
 
     let mut new_manifest = manifest.clone();
     new_manifest.version += 1;
@@ -304,8 +309,9 @@ pub fn rotate_encryption_key(
         turbolite_debug!("[rotate] verification passed: new data is readable");
     }
 
-    // COMMIT POINT: upload new manifest
-    s3.put_manifest(&new_manifest)?;
+    // COMMIT POINT: conditional PUT — fails with InvalidInput if some other
+    // writer touched the manifest during rotation (stale local etag_cell).
+    s3.commit_manifest(&new_manifest, &etag_cell)?;
     turbolite_debug!("[rotate] manifest uploaded (version {})", new_version);
 
     // GC old objects

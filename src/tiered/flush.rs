@@ -24,6 +24,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
     s3: &S3Client,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
     pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
     compression_level: i32,
@@ -53,7 +54,7 @@ pub(crate) fn flush_dirty_groups_to_s3(
 
     // Run the actual flush, restoring drained state on error so nothing is lost.
     let result = flush_inner(
-        s3, cache, shared_manifest, compression_level,
+        s3, cache, shared_manifest, shared_manifest_etag, compression_level,
         #[cfg(feature = "zstd")] dictionary,
         encryption_key, gc_enabled,
         &flushes, &legacy_dirty_groups,
@@ -81,6 +82,7 @@ fn flush_inner(
     s3: &S3Client,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
@@ -604,7 +606,8 @@ fn flush_inner(
         m.build_page_index();
         m
     };
-    s3.put_manifest(&new_manifest)?;
+    // CAS commit with the cached ETag — see handle.rs sync() for rationale.
+    s3.commit_manifest(&new_manifest, shared_manifest_etag)?;
     turbolite_debug!(
         "[flush] manifest v{} uploaded (page_count={}, {} groups)",
         new_manifest.version, new_manifest.page_count, new_manifest.page_group_keys.len(),
@@ -665,6 +668,7 @@ pub(crate) fn flush_local_groups(
     storage: &StorageClient,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     shared_dirty_groups: &Mutex<HashSet<u64>>,
     pending_flushes: &Mutex<Vec<staging::PendingFlush>>,
     compression_level: i32,
@@ -689,7 +693,7 @@ pub(crate) fn flush_local_groups(
 
     // Run inner flush, restoring drained state on error (same pattern as flush_to_s3)
     let result = flush_local_inner(
-        storage, cache, shared_manifest, compression_level,
+        storage, cache, shared_manifest, shared_manifest_etag, compression_level,
         #[cfg(feature = "zstd")] dictionary,
         encryption_key,
         &flushes, &legacy_dirty,
@@ -713,6 +717,7 @@ fn flush_local_inner(
     storage: &StorageClient,
     cache: &DiskCache,
     shared_manifest: &ArcSwap<Manifest>,
+    shared_manifest_etag: &std::sync::Mutex<Option<String>>,
     compression_level: i32,
     #[cfg(feature = "zstd")] dictionary: Option<&[u8]>,
     encryption_key: Option<[u8; 32]>,
@@ -925,7 +930,8 @@ fn flush_local_inner(
         ..Manifest::empty()
     };
 
-    storage.put_manifest(&new_manifest, &[])?;
+    // CAS commit (local/HTTP backends fall through to unconditional write).
+    storage.commit_manifest(&new_manifest, &[], shared_manifest_etag)?;
 
     // 9. Commit to shared manifest
     {
@@ -952,7 +958,7 @@ fn flush_local_inner(
     // Phase Drift-d: auto-compact overrides if threshold reached
     if compaction_threshold > 0 {
         if let Err(e) = compact::auto_compact_overrides(
-            storage, shared_manifest, compaction_threshold, compression_level,
+            storage, shared_manifest, shared_manifest_etag, compaction_threshold, compression_level,
             #[cfg(feature = "zstd")] dictionary,
             encryption_key,
         ) {
