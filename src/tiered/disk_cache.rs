@@ -166,6 +166,12 @@ pub(crate) struct DiskCache {
     pub(crate) interior_pages: parking_lot::Mutex<HashSet<u64>>,
     /// Individual index leaf page numbers (for cache preservation across clear_cache)
     pub(crate) index_pages: parking_lot::Mutex<HashSet<u64>>,
+    /// Dirty-page sets registered by live tiered handles (Weak: a dropped
+    /// handle unregisters itself). A dirty page's newest bytes exist ONLY in
+    /// this cache (Phase Marne) and sync() uploads from here, so scattered
+    /// fetch-fill writes must never overwrite them — doing so silently loses
+    /// the write at the next sync (monkut/rustyhip#33).
+    pub(crate) dirty_trackers: parking_lot::RwLock<Vec<std::sync::Weak<parking_lot::RwLock<HashSet<u64>>>>>,
     /// TTL tracking: group_id → last_access
     pub(crate) group_access: parking_lot::Mutex<HashMap<u64, Instant>>,
     pub(crate) ttl_secs: u64,
@@ -356,6 +362,7 @@ impl DiskCache {
             interior_groups: parking_lot::Mutex::new(HashSet::new()),
             interior_pages: parking_lot::Mutex::new(HashSet::new()),
             index_pages: parking_lot::Mutex::new(HashSet::new()),
+            dirty_trackers: parking_lot::RwLock::new(Vec::new()),
             group_access: parking_lot::Mutex::new(HashMap::new()),
             ttl_secs,
             pages_per_group,
@@ -432,7 +439,7 @@ impl DiskCache {
     }
 
     /// Promote scattered decoded pages directly into mem_cache (zero extra I/O).
-    pub(crate) fn promote_scattered_to_mem_cache(&self, page_nums: &[u64], raw_data: &[u8]) {
+    pub(crate) fn promote_scattered_to_mem_cache(&self, page_nums: &[u64], raw_data: &[u8], dirty_skip: &HashSet<u64>) {
         let mc = match self.mem_cache {
             Some(ref mc) => mc,
             None => return,
@@ -441,6 +448,12 @@ impl DiskCache {
         if ps == 0 { return; }
 
         for (i, &pnum) in page_nums.iter().enumerate() {
+            // The dirty write path nulls the page's mem slot so reads fall
+            // through to the dirty disk-cache bytes; promoting fetched data
+            // here would resurrect stale bytes (monkut/rustyhip#33).
+            if dirty_skip.contains(&pnum) {
+                continue;
+            }
             if let Some(slot) = mc.get(pnum as usize) {
                 let ptr = slot.load(Ordering::Relaxed);
                 let src_start = i * ps;
@@ -808,6 +821,32 @@ impl DiskCache {
 
     /// Write pages to the cache at non-consecutive positions (Phase Midway: B-tree-packed groups).
     /// `page_nums` maps position in `data` to actual page number.
+    /// Register a handle's dirty-page set so scattered fetch-fill writes can
+    /// refuse to overwrite locally-dirty pages. Weak: dropped handles fall out
+    /// on the next registration sweep.
+    pub(crate) fn register_dirty_tracker(&self, tracker: &Arc<parking_lot::RwLock<HashSet<u64>>>) {
+        let mut trackers = self.dirty_trackers.write();
+        trackers.retain(|w| w.strong_count() > 0);
+        trackers.push(Arc::downgrade(tracker));
+    }
+
+    /// Subset of `page_nums` currently dirty in any registered handle.
+    fn dirty_subset(&self, page_nums: &[u64]) -> HashSet<u64> {
+        let trackers = self.dirty_trackers.read();
+        let mut dirty = HashSet::new();
+        for weak in trackers.iter() {
+            if let Some(set) = weak.upgrade() {
+                let set = set.read();
+                for &pnum in page_nums {
+                    if set.contains(&pnum) {
+                        dirty.insert(pnum);
+                    }
+                }
+            }
+        }
+        dirty
+    }
+
     pub(crate) fn write_pages_scattered(&self, page_nums: &[u64], data: &[u8], gid: u64, start_index_in_group: u32) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
         let page_sz = self.page_size.load(Ordering::Acquire) as usize;
@@ -824,12 +863,23 @@ impl DiskCache {
             return Ok(());
         }
 
+        // Never overwrite a locally-dirty page with fetched (older) data: its
+        // newest bytes exist only in this cache and sync() uploads from here,
+        // so a clobber is durable write loss (monkut/rustyhip#33). The page
+        // stays present with its dirty bytes, so bitmap/tracker marks below
+        // remain valid for skipped pages. Unconditional log = production
+        // tripwire for confirming the mechanism under live traffic.
+        let dirty_skip = self.dirty_subset(written_pages);
+        for &pnum in &dirty_skip {
+            eprintln!("[turbolite][cache-guard] skipped scattered write over dirty page {pnum} (gid={gid})");
+        }
+
         if self.cache_compression {
-            return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group);
+            return self.write_pages_scattered_compressed(written_pages, data, page_sz, gid, start_index_in_group, &dirty_skip);
         }
 
         // Promote decoded pages to mem_cache before encryption
-        self.promote_scattered_to_mem_cache(written_pages, data);
+        self.promote_scattered_to_mem_cache(written_pages, data, &dirty_skip);
 
         // Find max page to size the cache file
         let max_page = written_pages.iter().copied().max().unwrap_or(0);
@@ -837,6 +887,9 @@ impl DiskCache {
 
         self.ensure_file_len(needed)?;
         for (i, &pnum) in written_pages.iter().enumerate() {
+            if dirty_skip.contains(&pnum) {
+                continue;
+            }
             let src_start = i * page_sz;
             let page_data = &data[src_start..src_start + page_sz];
             #[cfg(feature = "encryption")]
@@ -879,6 +932,8 @@ impl DiskCache {
     }
 
     /// Compressed scattered write: compress each page, append as contiguous blob.
+    /// Pages in `dirty_skip` are not written — their cache_index entries keep
+    /// pointing at the locally-dirty bytes (monkut/rustyhip#33).
     fn write_pages_scattered_compressed(
         &self,
         written_pages: &[u64],
@@ -886,6 +941,7 @@ impl DiskCache {
         page_sz: usize,
         gid: u64,
         start_index_in_group: u32,
+        dirty_skip: &HashSet<u64>,
     ) -> io::Result<()> {
         use std::os::unix::fs::FileExt;
 
@@ -897,6 +953,9 @@ impl DiskCache {
         let mut page_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(written_pages.len());
 
         for (i, &pnum) in written_pages.iter().enumerate() {
+            if dirty_skip.contains(&pnum) {
+                continue;
+            }
             let src_start = i * page_sz;
             let page_data = &data[src_start..src_start + page_sz];
 
