@@ -2327,3 +2327,46 @@ fn test_mem_cache_promotion_skips_dirty_pages() {
     cache.read_page(5, &mut buf).unwrap();
     assert_eq!(buf, dirty_bytes, "mem-cache promotion must not resurrect stale bytes");
 }
+
+#[test]
+fn test_scattered_write_race_never_clobbers_dirty_page() {
+    // Emulates the handle's locking discipline (tracker write lock held
+    // across flag + write) against a concurrent scatter-filler. Without the
+    // guard holding tracker read locks across its per-page check + write,
+    // the filler can check-clean then land stale bytes after the dirty
+    // write — this assert catches that interleaving.
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap());
+    let tracker = dirty_tracker(&[]);
+    cache.register_dirty_tracker(&tracker);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let filler = {
+        let cache = Arc::clone(&cache);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let stale = vec![0xAAu8; 64];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                cache.write_pages_scattered(&[5], &stale, 0, 0).unwrap();
+            }
+        })
+    };
+
+    let dirty_bytes = vec![0xDDu8; 64];
+    let mut buf = vec![0u8; 64];
+    for round in 0..2000 {
+        {
+            // Handle discipline: flag + write under the tracker write lock.
+            let mut dirty = tracker.write();
+            dirty.insert(5);
+            cache.write_page(5, &dirty_bytes).unwrap();
+        }
+        cache.read_page(5, &mut buf).unwrap();
+        assert_eq!(buf, dirty_bytes, "round {round}: dirty page clobbered by concurrent scattered write");
+        // Emulate post-sync clear so the filler can land again next round.
+        tracker.write().remove(&5);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    filler.join().unwrap();
+}
