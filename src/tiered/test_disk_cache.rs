@@ -2203,3 +2203,170 @@ fn test_mem_cache_invalidated_on_evict_group() {
     cache.read_page(0, &mut buf).unwrap();
     assert_eq!(buf[0], 0xFF, "after evict_group + new write, should read new data");
 }
+
+// =========================================================================
+// Dirty-page guard on scattered writes (monkut/rustyhip#33)
+// =========================================================================
+
+fn dirty_tracker(pages: &[u64]) -> Arc<parking_lot::RwLock<std::collections::HashSet<u64>>> {
+    Arc::new(parking_lot::RwLock::new(pages.iter().copied().collect()))
+}
+
+#[test]
+fn test_scattered_write_skips_dirty_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+    // Handle dirties page 5: newest bytes exist only in the cache.
+    let dirty_bytes = vec![0xDDu8; 64];
+    cache.write_page(5, &dirty_bytes).unwrap();
+    let tracker = dirty_tracker(&[5]);
+    cache.register_dirty_tracker(&tracker);
+
+    // Fetch-fill scatters pages 4..=6 with stale S3 data (the foreground
+    // miss path and prefetch workers both land here).
+    let page_nums = vec![4u64, 5, 6];
+    let stale: Vec<u8> = page_nums.iter().flat_map(|&pn| vec![pn as u8; 64]).collect();
+    cache.write_pages_scattered(&page_nums, &stale, 0, 0).unwrap();
+
+    let mut buf = vec![0u8; 64];
+    cache.read_page(5, &mut buf).unwrap();
+    assert_eq!(buf, dirty_bytes, "dirty page must not be overwritten by fetched data");
+    // Non-dirty neighbors in the same scattered write still land.
+    cache.read_page(4, &mut buf).unwrap();
+    assert_eq!(buf, vec![4u8; 64]);
+    cache.read_page(6, &mut buf).unwrap();
+    assert_eq!(buf, vec![6u8; 64]);
+    // Skipped page stays present: its dirty bytes are the newest version.
+    assert!(cache.is_present(5));
+}
+
+#[test]
+fn test_scattered_write_lands_after_dirty_cleared() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+    cache.write_page(5, &vec![0xDDu8; 64]).unwrap();
+    let tracker = dirty_tracker(&[5]);
+    cache.register_dirty_tracker(&tracker);
+
+    // sync() clears the handle's dirty set after upload — fetched data may land again.
+    tracker.write().clear();
+
+    let page_nums = vec![5u64];
+    cache.write_pages_scattered(&page_nums, &vec![0x11u8; 64], 0, 0).unwrap();
+    let mut buf = vec![0u8; 64];
+    cache.read_page(5, &mut buf).unwrap();
+    assert_eq!(buf, vec![0x11u8; 64], "clean page should accept fetched data");
+}
+
+#[test]
+fn test_scattered_write_ignores_dropped_tracker() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap();
+
+    cache.write_page(5, &vec![0xDDu8; 64]).unwrap();
+    let tracker = dirty_tracker(&[5]);
+    cache.register_dirty_tracker(&tracker);
+    drop(tracker); // handle dropped — Weak upgrade fails, guard disengages
+
+    let page_nums = vec![5u64];
+    cache.write_pages_scattered(&page_nums, &vec![0x22u8; 64], 0, 0).unwrap();
+    let mut buf = vec![0u8; 64];
+    cache.read_page(5, &mut buf).unwrap();
+    assert_eq!(buf, vec![0x22u8; 64]);
+}
+
+#[test]
+fn test_compressed_scattered_write_skips_dirty_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = compressed_cache(dir.path(), 64, 16);
+
+    let dirty_bytes = vec![0xDDu8; 64];
+    cache.write_page(5, &dirty_bytes).unwrap();
+    let tracker = dirty_tracker(&[5]);
+    cache.register_dirty_tracker(&tracker);
+
+    let page_nums = vec![4u64, 5, 6];
+    let stale: Vec<u8> = page_nums.iter().flat_map(|&pn| vec![pn as u8; 64]).collect();
+    cache.write_pages_scattered(&page_nums, &stale, 0, 0).unwrap();
+
+    let mut buf = vec![0u8; 64];
+    cache.read_page(5, &mut buf).unwrap();
+    assert_eq!(buf, dirty_bytes, "dirty page must survive compressed scattered write");
+    cache.read_page(4, &mut buf).unwrap();
+    assert_eq!(buf, vec![4u8; 64]);
+    cache.read_page(6, &mut buf).unwrap();
+    assert_eq!(buf, vec![6u8; 64]);
+}
+
+#[test]
+fn test_mem_cache_promotion_skips_dirty_pages() {
+    let dir = TempDir::new().unwrap();
+    let cache = DiskCache::new_with_compression(
+        dir.path(), 3600, 8, 2, 64, 16, None, Vec::new(),
+        false, 3,
+        #[cfg(feature = "zstd")]
+        None,
+        1 << 20, // mem_cache enabled
+    )
+    .unwrap();
+
+    // Dirty write path: page in cache file, mem slot cleared.
+    let dirty_bytes = vec![0xDDu8; 64];
+    cache.write_page(5, &dirty_bytes).unwrap();
+    cache.clear_pages_from_mem_cache(&[5]);
+    let tracker = dirty_tracker(&[5]);
+    cache.register_dirty_tracker(&tracker);
+
+    let page_nums = vec![5u64];
+    cache.write_pages_scattered(&page_nums, &vec![0x33u8; 64], 0, 0).unwrap();
+
+    // Neither the mem cache nor the file may serve the stale fetched bytes.
+    let mut buf = vec![0u8; 64];
+    cache.read_page(5, &mut buf).unwrap();
+    assert_eq!(buf, dirty_bytes, "mem-cache promotion must not resurrect stale bytes");
+}
+
+#[test]
+fn test_scattered_write_race_never_clobbers_dirty_page() {
+    // Emulates the handle's locking discipline (tracker write lock held
+    // across flag + write) against a concurrent scatter-filler. Without the
+    // guard holding tracker read locks across its per-page check + write,
+    // the filler can check-clean then land stale bytes after the dirty
+    // write — this assert catches that interleaving.
+    let dir = TempDir::new().unwrap();
+    let cache = Arc::new(DiskCache::new(dir.path(), 3600, 8, 2, 64, 16, None, Vec::new()).unwrap());
+    let tracker = dirty_tracker(&[]);
+    cache.register_dirty_tracker(&tracker);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let filler = {
+        let cache = Arc::clone(&cache);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let stale = vec![0xAAu8; 64];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                cache.write_pages_scattered(&[5], &stale, 0, 0).unwrap();
+            }
+        })
+    };
+
+    let dirty_bytes = vec![0xDDu8; 64];
+    let mut buf = vec![0u8; 64];
+    for round in 0..2000 {
+        {
+            // Handle discipline: flag + write under the tracker write lock.
+            let mut dirty = tracker.write();
+            dirty.insert(5);
+            cache.write_page(5, &dirty_bytes).unwrap();
+        }
+        cache.read_page(5, &mut buf).unwrap();
+        assert_eq!(buf, dirty_bytes, "round {round}: dirty page clobbered by concurrent scattered write");
+        // Emulate post-sync clear so the filler can land again next round.
+        tracker.write().remove(&5);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    filler.join().unwrap();
+}

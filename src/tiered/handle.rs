@@ -31,7 +31,10 @@ pub struct TurboliteHandle {
     /// Dirty page numbers (data lives in disk cache, not in memory).
     /// Phase Marne: replaced HashMap<u64, Vec<u8>> with HashSet<u64> to avoid
     /// holding a second copy of every dirty page in memory.
-    dirty_page_nums: RwLock<HashSet<u64>>,
+    /// Arc'd so the DiskCache can consult it from scattered fetch-fill writes
+    /// (both the foreground miss path and the prefetch workers) and refuse to
+    /// overwrite locally-dirty pages (monkut/rustyhip#33).
+    dirty_page_nums: Arc<RwLock<HashSet<u64>>>,
     /// Page group IDs that were locally checkpointed but not yet synced to S3.
     /// Populated during local-checkpoint-only mode; drained by flush_to_s3().
     /// Arc'd so flush_to_s3 can drain from outside SQLite lock.
@@ -335,13 +338,19 @@ impl TurboliteHandle {
 
         let staging_dir = cache.cache_dir.join("staging");
 
+        // Registered on the cache so scattered fetch-fill writes (foreground
+        // miss path + prefetch workers) skip pages this handle has dirtied
+        // but not yet synced (monkut/rustyhip#33).
+        let dirty_page_nums = Arc::new(RwLock::new(HashSet::new()));
+        cache.register_dirty_tracker(&dirty_page_nums);
+
         Ok(Self {
             s3,
             storage,
             cache: Some(cache),
             manifest: shared_manifest,
             manifest_etag: shared_manifest_etag,
-            dirty_page_nums: RwLock::new(HashSet::new()),
+            dirty_page_nums,
             s3_dirty_groups: shared_dirty_groups,
             page_size: std::sync::atomic::AtomicU32::new(page_size),
             pages_per_group,
@@ -390,7 +399,7 @@ impl TurboliteHandle {
             cache: None,
             manifest: Arc::new(ArcSwap::from_pointee(Manifest::empty())),
             manifest_etag: Arc::new(std::sync::Mutex::new(None)),
-            dirty_page_nums: RwLock::new(HashSet::new()),
+            dirty_page_nums: Arc::new(RwLock::new(HashSet::new())),
             s3_dirty_groups: Arc::new(Mutex::new(HashSet::new())),
             page_size: std::sync::atomic::AtomicU32::new(0),
             pages_per_group: DEFAULT_PAGES_PER_GROUP,
@@ -1503,25 +1512,38 @@ impl DatabaseHandle for TurboliteHandle {
             }
         }
 
-        // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory)
-        if let Some(cache) = &self.cache {
-            cache.write_page(page_num, buf)?;
-            // Invalidate mem_cache for this page so reads see the fresh disk write,
-            // not a stale in-memory copy from a prior S3 fetch.
-            cache.clear_pages_from_mem_cache(&[page_num]);
+        // Write to local cache and track as dirty (Phase Marne: data only in cache, not in memory).
+        // Mark dirty BEFORE writing, holding the tracker write lock across the
+        // flag + cache write + mem-slot clear: scattered fetch-fills hold the
+        // read lock across their per-page check + write, so a concurrent fill
+        // either observes the flag and skips, or completes entirely before
+        // these newer bytes land (monkut/rustyhip#33).
+        {
+            let mut dirty = self.dirty_page_nums.write();
+            dirty.insert(page_num);
+            if let Some(cache) = &self.cache {
+                if let Err(e) = cache.write_page(page_num, buf) {
+                    // Bytes didn't land — don't leave a dirty flag pointing at
+                    // stale cache content.
+                    dirty.remove(&page_num);
+                    return Err(e);
+                }
+                // Invalidate mem_cache for this page so reads see the fresh disk write,
+                // not a stale in-memory copy from a prior S3 fetch.
+                cache.clear_pages_from_mem_cache(&[page_num]);
 
-            // Detect interior pages at write time (avoids re-reading during sync).
-            let hdr_off = if page_num == 0 { 100 } else { 0 };
-            let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
-            if type_byte == 0x05 || type_byte == 0x02 {
-                // Look up group assignment. For new pages not yet assigned, this returns None
-                // and sync() will handle them after assign_new_pages_to_groups.
-                if let Some(loc) = self.manifest.load().page_location(page_num) {
-                    cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                // Detect interior pages at write time (avoids re-reading during sync).
+                let hdr_off = if page_num == 0 { 100 } else { 0 };
+                let type_byte = buf.get(hdr_off).copied().unwrap_or(0);
+                if type_byte == 0x05 || type_byte == 0x02 {
+                    // Look up group assignment. For new pages not yet assigned, this returns None
+                    // and sync() will handle them after assign_new_pages_to_groups.
+                    if let Some(loc) = self.manifest.load().page_location(page_num) {
+                        cache.mark_interior_group(loc.group_id, page_num, loc.index);
+                    }
                 }
             }
         }
-        self.dirty_page_nums.write().insert(page_num);
         self.dirty_since_sync = true;
 
         // Phase Kursk: append to staging log for LocalThenFlush mode.
